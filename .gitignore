@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual envs
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Data & artifacts (DO NOT COMMIT)
+data/raw/
+artifacts/
+reports/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Env
+.env
+.env.*

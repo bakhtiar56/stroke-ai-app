@@ -1,0 +1,24 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - STROKE_MODEL_PATH=/app/artifacts/model.joblib
+      - STROKE_THRESHOLD_PATH=/app/artifacts/threshold.json
+      - STROKE_FEATURE_IMPORTANCE_PATH=/app/artifacts/feature_importance.json
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+
+  ui:
+    build:
+      context: .
+      dockerfile: docker/ui.Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE_URL=http://api:8000
+    depends_on:
+      - api
