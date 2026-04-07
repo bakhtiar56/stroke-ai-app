@@ -1,23 +1,32 @@
 .PHONY: setup test lint train run-api run-ui docker-build docker-up
 
+ifeq ($(OS),Windows_NT)
+  PY := .\.venv\Scripts\python.exe
+  PIP := .\.venv\Scripts\pip.exe
+else
+  PY := ./.venv/bin/python
+  PIP := ./.venv/bin/pip
+endif
+
 setup:
 	python -m venv .venv
-	. .venv/bin/activate && pip install -U pip && pip install -e ".[dev]"
+	$(PY) -m pip install -U pip
+	$(PIP) install -e ".[dev]"
 
 test:
-	. .venv/bin/activate && pytest -q
+	$(PY) -m pytest -q
 
 lint:
-	. .venv/bin/activate && ruff check .
+	$(PY) -m ruff check .
 
 train:
-	. .venv/bin/activate && python -m stroke_ai.models.train
+	$(PY) -m stroke_ai.models.train
 
 run-api:
-	. .venv/bin/activate && uvicorn apps.api.main:app --reload --host 0.0.0.0 --port 8000
+	$(PY) -m uvicorn apps.api.main:app --reload --host 0.0.0.0 --port 8000
 
 run-ui:
-	. .venv/bin/activate && streamlit run apps/ui/app.py
+	$(PY) -m streamlit run apps/ui/app.py
 
 docker-build:
 	docker compose build

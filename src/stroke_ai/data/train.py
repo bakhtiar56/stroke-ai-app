@@ -9,10 +9,10 @@ import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from imblearn.over_sampling import RandomOverSampler
 from lightgbm import LGBMClassifier
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
@@ -40,7 +40,7 @@ class Metrics:
     roc_auc: float
     pr_auc: float
     brier: float
-    threshold: float  # reference threshold from validation (monitoring only)
+    threshold: float
     recall: float
     precision: float
     f1: float
@@ -49,9 +49,6 @@ class Metrics:
     positive_rate_val: float
     positive_rate_test: float
     trained_at: str
-    imbalance_strategy: str
-    top_k: float
-    flag_rate_test: float
 
 
 def _ensure_dirs() -> None:
@@ -59,7 +56,7 @@ def _ensure_dirs() -> None:
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _build_preprocess() -> ColumnTransformer:
+def _build_pipeline(random_state: int) -> Pipeline:
     numeric_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
@@ -80,18 +77,61 @@ def _build_preprocess() -> ColumnTransformer:
         ],
         remainder="drop",
     )
-    return preprocessor
 
-
-def _build_model(random_state: int) -> LGBMClassifier:
-    return LGBMClassifier(
-        n_estimators=600,
+    clf = LGBMClassifier(
+        n_estimators=500,
         learning_rate=0.05,
         num_leaves=31,
         random_state=random_state,
+        class_weight="balanced",
         n_jobs=-1,
-        class_weight=None,  # don't double-compensate; oversampling handles imbalance
     )
+
+    return Pipeline(steps=[("preprocess", preprocessor), ("model", clf)])
+
+
+def _pick_threshold(y_val: np.ndarray, proba_val: np.ndarray, min_recall: float = 0.85) -> float:
+    # Candidate thresholds from unique probabilities
+    thresholds = np.unique(proba_val)
+    # Make sure 0/1 extremes are considered
+    thresholds = np.concatenate(([0.0], thresholds, [1.0]))
+
+    best = None  # (meets_recall, precision, -threshold, threshold)
+    for t in thresholds:
+        pred = (proba_val >= t).astype(int)
+        rec = recall_score(y_val, pred, zero_division=0)
+        prec = precision_score(y_val, pred, zero_division=0)
+
+        meets = rec >= min_recall
+        key = (1 if meets else 0, prec, -t, t)
+        if best is None or key > best[0]:
+            best = (key, t)
+
+    chosen = float(best[1])
+
+    # If nothing meets recall, fall back to best F1
+    pred = (proba_val >= chosen).astype(int)
+    if recall_score(y_val, pred, zero_division=0) < min_recall:
+        best_f1 = -1.0
+        best_t = 0.5
+        for t in thresholds:
+            pred = (proba_val >= t).astype(int)
+            f1 = f1_score(y_val, pred, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_t = float(t)
+        chosen = best_t
+
+    return chosen
+
+
+def _risk_band(p: float) -> str:
+    # Simple bands for UI. (Not clinical.)
+    if p < 0.10:
+        return "low"
+    if p < 0.30:
+        return "medium"
+    return "high"
 
 
 def _plot_roc(y_true: np.ndarray, proba: np.ndarray, outpath: Path) -> float:
@@ -126,6 +166,7 @@ def _plot_pr(y_true: np.ndarray, proba: np.ndarray, outpath: Path) -> float:
 
 
 def _plot_calibration(y_true: np.ndarray, proba: np.ndarray, outpath: Path, n_bins: int = 10) -> float:
+    # Lightweight reliability plot without extra deps
     bins = np.linspace(0.0, 1.0, n_bins + 1)
     bin_ids = np.digitize(proba, bins) - 1
     bin_ids = np.clip(bin_ids, 0, n_bins - 1)
@@ -154,77 +195,8 @@ def _plot_calibration(y_true: np.ndarray, proba: np.ndarray, outpath: Path, n_bi
     return float(brier)
 
 
-def _get_feature_names(preprocess: ColumnTransformer) -> list[str]:
-    names = list(NUMERIC_COLS)
-    ohe = preprocess.named_transformers_["cat"].named_steps["onehot"]
-    names.extend(list(ohe.get_feature_names_out(CATEGORICAL_COLS)))
-    return names
-
-
-def _permutation_importance_manual(
-    model: LGBMClassifier,
-    X_val_t: np.ndarray,
-    y_val: np.ndarray,
-    feature_names: list[str],
-    random_state: int,
-    n_repeats: int = 10,
-) -> list[dict]:
-    rng = np.random.default_rng(random_state)
-    baseline = roc_auc_score(y_val, model.predict_proba(X_val_t)[:, 1])
-
-    importances = np.zeros(X_val_t.shape[1], dtype=float)
-    X_work = X_val_t.copy()
-
-    for j in range(X_val_t.shape[1]):
-        scores = []
-        original_col = X_work[:, j].copy()
-        for _ in range(n_repeats):
-            rng.shuffle(X_work[:, j])
-            score = roc_auc_score(y_val, model.predict_proba(X_work)[:, 1])
-            scores.append(score)
-        X_work[:, j] = original_col
-        importances[j] = baseline - float(np.mean(scores))
-
-    fi = sorted(
-        [{"feature": feature_names[i], "importance": float(importances[i])} for i in range(len(feature_names))],
-        key=lambda x: x["importance"],
-        reverse=True,
-    )
-    topn = fi[:15]
-    denom = sum(abs(x["importance"]) for x in topn) or 1.0
-    for x in topn:
-        x["importance"] = float(abs(x["importance"]) / denom)
-    return topn
-
-
-def _pick_threshold_topk_reference(proba_val: np.ndarray, top_k: float) -> float:
-    """
-    Reference threshold for monitoring only. Actual screening uses exact-rank top-k.
-    """
-    if not (0.0 < top_k < 1.0):
-        raise ValueError("top_k must be between 0 and 1")
-    return float(np.quantile(proba_val, 1.0 - top_k))
-
-
-def _predict_topk_by_rank(proba: np.ndarray, top_k: float) -> np.ndarray:
-    """
-    Return 0/1 predictions that flag exactly ceil(top_k * n) highest probabilities.
-    """
-    if not (0.0 < top_k < 1.0):
-        raise ValueError("top_k must be between 0 and 1")
-
-    n = len(proba)
-    k = int(np.ceil(top_k * n))
-    order = np.argsort(-proba)  # descending
-
-    pred = np.zeros(n, dtype=int)
-    pred[order[:k]] = 1
-    return pred
-
-
 def main() -> None:
     random_state = 42
-    top_k = 0.10  # policy: flag top 10% highest risk
     _ensure_dirs()
 
     df = load_stroke_csv()
@@ -240,26 +212,14 @@ def main() -> None:
         X_temp, y_temp, test_size=0.50, random_state=random_state, stratify=y_temp
     )
 
-    preprocess = _build_preprocess()
-    X_train_t = preprocess.fit_transform(X_train, y_train)
-    X_val_t = preprocess.transform(X_val)
-    X_test_t = preprocess.transform(X_test)
+    pipe = _build_pipeline(random_state=random_state)
+    pipe.fit(X_train, y_train)
 
-    # Oversample TRAIN only (no leakage)
-    ros = RandomOverSampler(random_state=random_state)
-    X_train_os, y_train_os = ros.fit_resample(X_train_t, y_train)
+    proba_val = pipe.predict_proba(X_val)[:, 1]
+    threshold = _pick_threshold(y_val.to_numpy(), proba_val, min_recall=0.85)
 
-    model = _build_model(random_state=random_state)
-    model.fit(X_train_os, y_train_os)
-
-    proba_val = model.predict_proba(X_val_t)[:, 1]
-    proba_test = model.predict_proba(X_test_t)[:, 1]
-
-    # reference threshold (monitoring only)
-    threshold_ref = _pick_threshold_topk_reference(proba_val, top_k=top_k)
-
-    # policy decision: exact top-k by rank
-    pred_test = _predict_topk_by_rank(proba_test, top_k=top_k)
+    proba_test = pipe.predict_proba(X_test)[:, 1]
+    pred_test = (proba_test >= threshold).astype(int)
 
     roc_auc = _plot_roc(y_test.to_numpy(), proba_test, PLOTS_DIR / "roc_curve.png")
     pr_auc = _plot_pr(y_test.to_numpy(), proba_test, PLOTS_DIR / "pr_curve.png")
@@ -270,14 +230,12 @@ def main() -> None:
     prec = float(precision_score(y_test, pred_test, zero_division=0))
     f1 = float(f1_score(y_test, pred_test, zero_division=0))
 
-    flag_rate_test = float(np.mean(pred_test == 1))
-
     trained_at = datetime.now(timezone.utc).isoformat()
     metrics = Metrics(
         roc_auc=float(roc_auc),
         pr_auc=float(pr_auc),
         brier=float(brier),
-        threshold=float(threshold_ref),
+        threshold=float(threshold),
         recall=rec,
         precision=prec,
         f1=f1,
@@ -286,58 +244,49 @@ def main() -> None:
         positive_rate_val=float(y_val.mean()),
         positive_rate_test=float(y_test.mean()),
         trained_at=trained_at,
-        imbalance_strategy="random_oversample_train_only",
-        top_k=float(top_k),
-        flag_rate_test=float(flag_rate_test),
     )
 
-    feature_names = _get_feature_names(preprocess)
-    top_factors = _permutation_importance_manual(
-        model=model,
-        X_val_t=np.asarray(X_val_t),
-        y_val=y_val.to_numpy(),
-        feature_names=feature_names,
-        random_state=random_state,
-        n_repeats=10,
+    # Permutation importance on validation set
+    perm = permutation_importance(
+        pipe, X_val, y_val, n_repeats=15, random_state=random_state, scoring="roc_auc", n_jobs=-1
     )
 
-    # Save inference artifact: preprocess + model
-    inference_pipeline = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
-    joblib.dump(inference_pipeline, ARTIFACTS_DIR / "model.joblib")
+    # Get transformed feature names from the preprocessing step
+    preprocess = pipe.named_steps["preprocess"]
+    feature_names = []
+    # numeric features
+    feature_names.extend(NUMERIC_COLS)
+    # categorical OHE feature names
+    ohe = preprocess.named_transformers_["cat"].named_steps["onehot"]
+    cat_feature_names = list(ohe.get_feature_names_out(CATEGORICAL_COLS))
+    feature_names.extend(cat_feature_names)
 
-    (ARTIFACTS_DIR / "threshold.json").write_text(
-        json.dumps(
-            {
-                "threshold": float(threshold_ref),
-                "policy": "top_k",
-                "top_k": float(top_k),
-                "picked_on": "validation",
-                "notes": "Threshold is a reference quantile from validation for monitoring only. Screening uses exact rank top-k.",
-            },
-            indent=2,
-        )
-    )
-    (ARTIFACTS_DIR / "decision_policy.json").write_text(
-        json.dumps(
-            {
-                "policy": "top_k",
-                "top_k": float(top_k),
-                "picked_on": "validation",
-                "method": "exact_rank",
-                "notes": "Capacity-based screening policy. Use /screen for top-k flagging; /predict returns risk only.",
-            },
-            indent=2,
-        )
+    importances = perm.importances_mean
+    fi = sorted(
+        [{"feature": str(f), "importance": float(i)} for f, i in zip(feature_names, importances)],
+        key=lambda x: x["importance"],
+        reverse=True,
     )
 
+    # Normalize for API display (optional but nice)
+    topn = fi[:15]
+    denom = sum(abs(x["importance"]) for x in topn) or 1.0
+    for x in topn:
+        x["importance"] = float(abs(x["importance"]) / denom)
+
+    # Save artifacts
+    joblib.dump(pipe, ARTIFACTS_DIR / "model.joblib")
+
+    (ARTIFACTS_DIR / "threshold.json").write_text(json.dumps({"threshold": threshold}, indent=2))
     (ARTIFACTS_DIR / "metrics.json").write_text(json.dumps(asdict(metrics), indent=2))
-    (ARTIFACTS_DIR / "feature_importance.json").write_text(json.dumps({"top_factors": top_factors}, indent=2))
+    (ARTIFACTS_DIR / "feature_importance.json").write_text(json.dumps({"top_factors": topn}, indent=2))
 
+    # Also save a tiny model-info summary for convenience
     model_info = {
         "model_version": "0.1.0",
         "trained_at": trained_at,
-        "decision_policy": {"policy": "top_k", "top_k": float(top_k), "method": "exact_rank"},
-        "threshold_reference": float(threshold_ref),
+        "threshold": float(threshold),
+        "risk_band_note": "Bands are non-clinical demo buckets: <0.10 low, <0.30 medium, else high.",
         "metrics": {
             "roc_auc": metrics.roc_auc,
             "pr_auc": metrics.pr_auc,
@@ -345,19 +294,20 @@ def main() -> None:
             "recall": metrics.recall,
             "precision": metrics.precision,
             "f1": metrics.f1,
-            "flag_rate_test": metrics.flag_rate_test,
         },
         "features": list(X.columns),
-        "imbalance_strategy": metrics.imbalance_strategy,
     }
     (ARTIFACTS_DIR / "model_info.json").write_text(json.dumps(model_info, indent=2))
 
-    print(
-        f"Policy=top_k({top_k:.2f}) | test flag_rate={flag_rate_test:.3f} "
-        f"| recall={rec:.3f} precision={prec:.3f} f1={f1:.3f} "
-        f"| ROC-AUC={roc_auc:.3f} PR-AUC={pr_auc:.3f}"
-    )
-    print("Saved artifacts to artifacts/.")
+    print("Saved artifacts to artifacts/:")
+    print("- model.joblib")
+    print("- threshold.json")
+    print("- metrics.json")
+    print("- feature_importance.json")
+    print("- model_info.json")
+    print("- plots/*.png")
+    print(f"Chosen threshold={threshold:.4f} | test recall={rec:.3f} precision={prec:.3f} f1={f1:.3f}")
+    print(f"Example risk bands: low/medium/high; (demo) e.g. p=0.12 -> {_risk_band(0.12)}")
 
 
 if __name__ == "__main__":

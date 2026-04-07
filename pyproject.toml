@@ -26,6 +26,7 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.4",
   "httpx>=0.27", # for FastAPI TestClient dependencies
+  "imbalanced-learn>=0.12"
 ]
 
 [tool.setuptools]
