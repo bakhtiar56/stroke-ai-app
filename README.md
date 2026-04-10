@@ -98,8 +98,6 @@ UI:
 ## Docker (optional)
 A `docker-compose.yml` is included. I recommend using Docker Desktop + Linux engine (WSL2) on Windows.
 
-Note: I could not test Docker on my current machine (Docker Desktop installation not available), so please use the non-Docker quickstart above if you run into environment issues.
-
 ---
 
 ## Repo structure
