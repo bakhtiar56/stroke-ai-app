@@ -2,20 +2,19 @@ services:
   api:
     build:
       context: .
-      dockerfile: docker/api.Dockerfile
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     environment:
-      - STROKE_MODEL_PATH=/app/artifacts/model.joblib
-      - STROKE_THRESHOLD_PATH=/app/artifacts/threshold.json
-      - STROKE_FEATURE_IMPORTANCE_PATH=/app/artifacts/feature_importance.json
+      - PYTHONUNBUFFERED=1
     volumes:
-      - ./artifacts:/app/artifacts:ro
+      # Mount artifacts for easy iteration; for production you can bake them in instead
+      - ./artifacts:/app/artifacts
 
   ui:
     build:
       context: .
-      dockerfile: docker/ui.Dockerfile
+      dockerfile: apps/ui/Dockerfile
     ports:
       - "8501:8501"
     environment:
